@@ -1,0 +1,113 @@
+name: Build and Release Android App
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build APK & AAB
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Verify Java Version
+        run: |
+          java -version
+          JAVA_MAJOR=$(java -version 2>&1 | head -n 1 | awk -F '"' '{print $2}' | cut -d'.' -f1)
+          if [ "$JAVA_MAJOR" -lt 17 ]; then
+            echo "Error: Java version must be >= 17 (found: $JAVA_MAJOR)"
+            exit 1
+          fi
+
+      - name: Set up Gradle 9.3.1
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Generate Debug Keystore if missing
+        run: |
+          if [ ! -f ./debug.keystore ]; then
+            echo "Generating temporary debug keystore..."
+            keytool -genkey -v -keystore ./debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build Debug APK
+        run: gradle :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Build Debug AAB
+        run: gradle :app:bundleDebug --stacktrace --no-daemon
+
+      - name: Verify Build Outputs
+        run: |
+          if [ ! -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            echo "Error: APK not found at app/build/outputs/apk/debug/app-debug.apk"
+            exit 1
+          fi
+          if [ ! -f app/build/outputs/bundle/debug/app-debug.aab ]; then
+            echo "Error: AAB not found at app/build/outputs/bundle/debug/app-debug.aab"
+            exit 1
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Upload AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-aab
+          path: app/build/outputs/bundle/debug/app-debug.aab
+          if-no-files-found: error
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p runner_release
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          cp app/build/outputs/apk/debug/app-debug.apk "runner_release/${REPO_NAME}-debug-build-${GITHUB_RUN_NUMBER}.apk"
+          cp app/build/outputs/bundle/debug/app-debug.aab "runner_release/${REPO_NAME}-debug-build-${GITHUB_RUN_NUMBER}.aab"
+          echo "PREPARED_APK=runner_release/${REPO_NAME}-debug-build-${GITHUB_RUN_NUMBER}.apk" >> $GITHUB_ENV
+          echo "PREPARED_AAB=runner_release/${REPO_NAME}-debug-build-${GITHUB_RUN_NUMBER}.aab" >> $GITHUB_ENV
+
+      - name: Publish GitHub Release
+        id: create_release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="debug-apk-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          RELEASE_TITLE="Debug Build #${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG_NAME" \
+            "$PREPARED_APK" \
+            "$PREPARED_AAB" \
+            --title "$RELEASE_TITLE" \
+            --latest \
+            --notes "Automated debug build for commit $GITHUB_SHA"
+
+      - name: Report Build Summary
+        run: |
+          echo "### Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: Completed successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- **APK**: \`$(basename "$PREPARED_APK")\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **AAB**: \`$(basename "$PREPARED_AAB")\`" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.create_release.outcome }}" == "success" ]; then
+            echo "- **Release**: Created with tag \`debug-apk-build-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Release**: Skipped or encountered non-fatal error; artifacts remain accessible above." >> $GITHUB_STEP_SUMMARY
+          fi
